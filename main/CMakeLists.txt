@@ -1,0 +1,25 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "app_wifi.c"
+        "app_face.c"
+        "app_dashboard.c"
+        "ui_sundar.c"
+        "ui_guest.c"
+        "ui_user2.c"
+        "app_calendar.c"
+        "app_shortcuts.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        bsp_display
+        bsp_i2c
+        bsp_extra
+        bsp_camera
+        bsp_uart
+        lvgl
+        nvs_flash
+        esp_http_client
+        esp_timer
+        json
+        esp_wifi
+)
