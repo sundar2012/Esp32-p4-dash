@@ -42,10 +42,21 @@ static lv_obj_t *create_splash_screen(void)
 
 /* ──── Screensaver / Lock screen ──── */
 
+static void screensaver_tap_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Screen tapped — unlocking to guest dashboard");
+    app_dashboard_show(DASHBOARD_GUEST);
+}
+
 static lv_obj_t *create_screensaver_screen(void)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);
+
+    /* Make entire screen tappable to unlock */
+    lv_obj_add_flag(scr, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(scr, screensaver_tap_cb, LV_EVENT_CLICKED, NULL);
 
     /* Clock display */
     lv_obj_t *clock_lbl = lv_label_create(scr);
@@ -55,7 +66,7 @@ static lv_obj_t *create_screensaver_screen(void)
     lv_obj_align(clock_lbl, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_t *hint = lv_label_create(scr);
-    lv_label_set_text(hint, "Face the camera to unlock");
+    lv_label_set_text(hint, "Tap screen or face the camera to unlock");
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(hint, lv_color_hex(0x303040), 0);
     lv_obj_align(hint, LV_ALIGN_CENTER, 0, 30);

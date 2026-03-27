@@ -81,17 +81,23 @@ void app_main(void)
     /* Step 7: Initialize shortcuts module */
     app_shortcuts_init();
 
-    /* Step 8: Initialize face recognition and start scanning */
+    /* Step 8: Initialize face recognition */
     ESP_LOGI(TAG, "Starting face recognition...");
     ret = app_face_init();
     if (ret == ESP_OK) {
-        app_face_start();
+        /* Only start face scanning if camera is available */
+        /* For now, go straight to guest dashboard since face detection
+         * is not yet integrated with ESP-WHO models */
+        ESP_LOGI(TAG, "Face scanning deferred — showing guest dashboard");
     } else {
-        ESP_LOGW(TAG, "Face recognition unavailable — showing guest dashboard");
-        if (bsp_display_lock(-1)) {
-            app_dashboard_show(DASHBOARD_GUEST);
-            bsp_display_unlock();
-        }
+        ESP_LOGW(TAG, "Face recognition unavailable");
+    }
+
+    /* Show the guest dashboard after splash */
+    vTaskDelay(pdMS_TO_TICKS(1500));  /* Show splash for 1.5s */
+    if (bsp_display_lock(-1)) {
+        app_dashboard_show(DASHBOARD_GUEST);
+        bsp_display_unlock();
     }
 
     ESP_LOGI(TAG, "System initialization complete");
