@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_mipi_dsi.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -135,22 +136,12 @@ esp_err_t bsp_display_init(void)
         },
     };
 
-    /* The ILI9881C panel driver initialization would happen here.
-     * We use the generic MIPI-DSI DPI panel creation, with the panel-specific
-     * init sequence sent via DBI commands before starting video mode. */
-    esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = -1,
-        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = 16,
-    };
-
     /* Create the DPI video mode panel */
     ret = esp_lcd_new_panel_dpi(dsi_bus, &dpi_config, &s_panel_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to create DPI panel: %s", esp_err_to_name(ret));
         return ret;
     }
-    (void)panel_config; /* Used by panel-specific driver if needed */
 
     ret = esp_lcd_panel_init(s_panel_handle);
     if (ret != ESP_OK) {
