@@ -4,6 +4,7 @@
 #include "esp_cam_ctlr_csi.h"
 #include "esp_cam_ctlr.h"
 #include "esp_cam_sensor.h"
+#include "sc2336.h"
 #include "esp_sccb_intf.h"
 #include "esp_sccb_i2c.h"
 #include "driver/isp_core.h"
@@ -77,17 +78,12 @@ static esp_err_t camera_sensor_init(void)
         .sensor_port = ESP_CAM_SENSOR_MIPI_CSI,
     };
 
-    /* Try to create/detect the SC2336 sensor */
-    esp_cam_sensor_device_t *sensor = NULL;
-    ret = esp_cam_sensor_detect(&cam_config, &sensor);
-    if (ret != ESP_OK || !sensor) {
-        /* Try alternate detection method */
-        sensor = esp_cam_new_sensor(&cam_config);
-        if (!sensor) {
-            ESP_LOGE(TAG, "No camera sensor detected on SCCB bus (SCL=%d, SDA=%d)",
-                     BSP_CAMERA_SCCB_SCL, BSP_CAMERA_SCCB_SDA);
-            return ESP_ERR_NOT_FOUND;
-        }
+    /* Detect the SC2336 sensor on the SCCB bus */
+    esp_cam_sensor_device_t *sensor = sc2336_detect(&cam_config);
+    if (!sensor) {
+        ESP_LOGE(TAG, "SC2336 not detected on SCCB bus (SCL=%d, SDA=%d)",
+                 BSP_CAMERA_SCCB_SCL, BSP_CAMERA_SCCB_SDA);
+        return ESP_ERR_NOT_FOUND;
     }
 
     ESP_LOGI(TAG, "Camera sensor detected: %s", sensor->name);
