@@ -24,16 +24,15 @@ static TaskHandle_t s_lvgl_task_handle = NULL;
 #define BSP_LVGL_TICK_MS            5
 #define BSP_LVGL_BUF_HEIGHT         50  /* Partial buffer: 1024 * 50 * 2 bytes = 100KB per buf */
 
-/* LVGL flush callback — sends buffer to MIPI-DSI panel */
+/* LVGL flush callback — sends buffer to MIPI-DSI DPI panel */
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)lv_display_get_user_data(disp);
-    int x_start = area->x1;
-    int y_start = area->y1;
-    int x_end = area->x2 + 1;
-    int y_end = area->y2 + 1;
 
-    esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, px_map);
+    /* For DPI panels with double buffering, draw_bitmap
+     * copies the dirty region into the next frame buffer */
+    esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1,
+                              area->x2 + 1, area->y2 + 1, px_map);
     lv_display_flush_ready(disp);
 }
 
@@ -186,15 +185,18 @@ esp_err_t bsp_display_init(void)
     lv_display_set_user_data(s_display, s_panel_handle);
     lv_display_set_flush_cb(s_display, lvgl_flush_cb);
 
-    /* Allocate draw buffers in PSRAM for large display */
-    size_t buf_size = BSP_LCD_H_RES * BSP_LVGL_BUF_HEIGHT * sizeof(lv_color16_t);
-    void *buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
-    void *buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
-    if (!buf1 || !buf2) {
-        ESP_LOGE(TAG, "Failed to allocate LVGL draw buffers (%zu bytes)", buf_size);
+    /* Get the DPI panel's own frame buffers for direct-mode rendering.
+     * With num_fbs=2, the DPI panel owns two full frame buffers in PSRAM.
+     * LVGL draws directly into them, avoiding an extra copy step. */
+    void *fb0 = NULL;
+    void *fb1 = NULL;
+    esp_lcd_dpi_panel_get_frame_buffer(s_panel_handle, 2, &fb0, &fb1);
+    if (!fb0 || !fb1) {
+        ESP_LOGE(TAG, "Failed to get DPI frame buffers");
         return ESP_ERR_NO_MEM;
     }
-    lv_display_set_buffers(s_display, buf1, buf2, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    size_t fb_size = BSP_LCD_H_RES * BSP_LCD_V_RES * sizeof(lv_color16_t);
+    lv_display_set_buffers(s_display, fb0, fb1, fb_size, LV_DISPLAY_RENDER_MODE_DIRECT);
 
     /* Create LVGL touch input device */
     s_indev = lv_indev_create();
