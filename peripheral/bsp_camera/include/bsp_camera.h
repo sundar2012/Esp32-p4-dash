@@ -1,7 +1,6 @@
 #pragma once
 
 #include "esp_err.h"
-#include "esp_cam_ctlr_types.h"
 #include <stdint.h>
 #include <stddef.h>
 

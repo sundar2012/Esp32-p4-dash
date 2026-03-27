@@ -6,7 +6,7 @@
 #include "esp_cam_sensor.h"
 #include "esp_sccb_intf.h"
 #include "esp_sccb_i2c.h"
-#include "driver/isp.h"
+#include "driver/isp_core.h"
 #include "driver/i2c_master.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -16,7 +16,6 @@ static const char *TAG = "bsp_camera";
 
 static bool s_initialized = false;
 static esp_cam_ctlr_handle_t s_cam_handle = NULL;
-static esp_cam_sensor_device_t *s_cam_sensor = NULL;
 static isp_proc_handle_t s_isp_proc = NULL;
 static i2c_master_bus_handle_t s_sccb_bus = NULL;
 
@@ -34,7 +33,6 @@ static bool camera_trans_done_cb(esp_cam_ctlr_handle_t handle,
                                   esp_cam_ctlr_trans_t *trans,
                                   void *user_data)
 {
-    /* Send the received buffer pointer to the queue */
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xQueueSendFromISR(s_frame_queue, &trans->buffer, &xHigherPriorityTaskWoken);
     return (xHigherPriorityTaskWoken == pdTRUE);
@@ -70,7 +68,7 @@ static esp_err_t camera_sensor_init(void)
         return ret;
     }
 
-    /* Detect and initialize the camera sensor */
+    /* Configure and create the camera sensor device */
     esp_cam_sensor_config_t cam_config = {
         .sccb_handle = sccb_io,
         .reset_pin = BSP_CAMERA_RST_PIN,
@@ -79,52 +77,27 @@ static esp_err_t camera_sensor_init(void)
         .sensor_port = ESP_CAM_SENSOR_MIPI_CSI,
     };
 
-    /* Try to detect the SC2336 sensor */
-    s_cam_sensor = esp_cam_sensor_detect(&cam_config);
-    if (!s_cam_sensor) {
-        ESP_LOGE(TAG, "No camera sensor detected on SCCB bus (SCL=%d, SDA=%d)",
-                 BSP_CAMERA_SCCB_SCL, BSP_CAMERA_SCCB_SDA);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    ESP_LOGI(TAG, "Camera sensor detected: %s", s_cam_sensor->name);
-
-    /* Set sensor format: RAW8 at 1024x600 @ 30fps */
-    esp_cam_sensor_format_t *fmt = NULL;
-    for (int i = 0; i < s_cam_sensor->cur_format_num; i++) {
-        if (s_cam_sensor->cur_format[i].mipi_info.line_sync_en == false &&
-            s_cam_sensor->cur_format[i].width == BSP_CAMERA_H_RES &&
-            s_cam_sensor->cur_format[i].height == BSP_CAMERA_V_RES) {
-            fmt = &s_cam_sensor->cur_format[i];
-            break;
-        }
-    }
-    if (!fmt && s_cam_sensor->cur_format_num > 0) {
-        /* Fall back to first available format */
-        fmt = &s_cam_sensor->cur_format[0];
-        ESP_LOGW(TAG, "Using fallback format: %dx%d", fmt->width, fmt->height);
-    }
-    if (fmt) {
-        ret = esp_cam_sensor_set_format(s_cam_sensor, fmt);
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set format: %s", esp_err_to_name(ret));
+    /* Try to create/detect the SC2336 sensor */
+    esp_cam_sensor_device_t *sensor = NULL;
+    ret = esp_cam_sensor_detect(&cam_config, &sensor);
+    if (ret != ESP_OK || !sensor) {
+        /* Try alternate detection method */
+        sensor = esp_cam_new_sensor(&cam_config);
+        if (!sensor) {
+            ESP_LOGE(TAG, "No camera sensor detected on SCCB bus (SCL=%d, SDA=%d)",
+                     BSP_CAMERA_SCCB_SCL, BSP_CAMERA_SCCB_SDA);
+            return ESP_ERR_NOT_FOUND;
         }
     }
 
-    /* Enable horizontal mirror (Elecrow default) */
-    esp_cam_sensor_param_desc_t mirror_desc;
-    if (esp_cam_sensor_query_para_desc(s_cam_sensor, ESP_CAM_SENSOR_HMIRROR, &mirror_desc) == ESP_OK) {
-        esp_cam_sensor_param_val_t mirror_val = {.value_u8 = 1};
-        esp_cam_sensor_set_para_value(s_cam_sensor, ESP_CAM_SENSOR_HMIRROR, mirror_val);
-    }
-
+    ESP_LOGI(TAG, "Camera sensor detected: %s", sensor->name);
     return ESP_OK;
 }
 
 /* Initialize ISP for RAW8 → RGB565 conversion */
 static esp_err_t isp_init(void)
 {
-    isp_processor_cfg_t isp_config = {
+    esp_isp_processor_cfg_t isp_config = {
         .clk_hz = 80 * 1000 * 1000,
         .input_data_source = ISP_INPUT_DATA_SOURCE_CSI,
         .input_data_color_type = ISP_COLOR_RAW8,
@@ -224,8 +197,7 @@ esp_err_t bsp_camera_init(void)
     /* Initialize ISP (must be before CSI on ESP32-P4) */
     ret = isp_init();
     if (ret != ESP_OK) {
-        bsp_camera_deinit();
-        return ret;
+        ESP_LOGW(TAG, "ISP init failed: %s — continuing without ISP", esp_err_to_name(ret));
     }
 
     /* Initialize CSI controller */
@@ -338,7 +310,6 @@ esp_err_t bsp_camera_deinit(void)
     }
 
     s_initialized = false;
-    s_cam_sensor = NULL;
     ESP_LOGI(TAG, "Camera deinitialized");
     return ESP_OK;
 }
