@@ -7,6 +7,7 @@
 #include "esp_lcd_ek79007.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -19,18 +20,88 @@ static esp_lcd_panel_handle_t s_panel_handle = NULL;
 static SemaphoreHandle_t s_lvgl_mutex = NULL;
 static TaskHandle_t s_lvgl_task_handle = NULL;
 
+/* GT911 touch controller handle */
+static i2c_master_dev_handle_t s_gt911_handle = NULL;
+
 #define BSP_LVGL_TASK_STACK_SIZE    (8 * 1024)
 #define BSP_LVGL_TASK_PRIORITY      5
 #define BSP_LVGL_TICK_MS            5
-#define BSP_LVGL_BUF_HEIGHT         50  /* Partial buffer: 1024 * 50 * 2 bytes = 100KB per buf */
+
+/* ──── GT911 Touch Controller Driver ──── */
+
+/* GT911 register addresses */
+#define GT911_REG_STATUS    0x814E
+#define GT911_REG_POINT1    0x8150
+
+static esp_err_t gt911_read_reg(uint16_t reg, uint8_t *data, size_t len)
+{
+    uint8_t reg_buf[2] = { (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF) };
+    return i2c_master_transmit_receive(s_gt911_handle, reg_buf, 2, data, len, 50);
+}
+
+static esp_err_t gt911_write_reg(uint16_t reg, uint8_t val)
+{
+    uint8_t buf[3] = { (uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF), val };
+    return i2c_master_transmit(s_gt911_handle, buf, 3, 50);
+}
+
+static esp_err_t gt911_init(void)
+{
+    i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
+    if (!i2c_bus) {
+        ESP_LOGE(TAG, "I2C bus not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Reset GT911 with INT low → selects I2C address 0x5D */
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BSP_TOUCH_RST_PIN) | (1ULL << BSP_TOUCH_INT_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+
+    gpio_set_level((gpio_num_t)BSP_TOUCH_INT_PIN, 0);
+    gpio_set_level((gpio_num_t)BSP_TOUCH_RST_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level((gpio_num_t)BSP_TOUCH_RST_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Release INT pin to input after reset (address is latched) */
+    gpio_set_direction((gpio_num_t)BSP_TOUCH_INT_PIN, GPIO_MODE_INPUT);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    /* Add GT911 I2C device */
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = BSP_TOUCH_I2C_ADDR,
+        .scl_speed_hz = BSP_I2C_FREQ_HZ,
+    };
+    esp_err_t ret = i2c_master_bus_add_device(i2c_bus, &dev_cfg, &s_gt911_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add GT911 device: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    /* Read product ID to verify communication */
+    uint8_t product_id[4] = {0};
+    ret = gt911_read_reg(0x8140, product_id, 4);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "GT911 product ID: %c%c%c%c", product_id[0], product_id[1],
+                 product_id[2], product_id[3]);
+    } else {
+        ESP_LOGW(TAG, "GT911 read failed: %s (touch may not work)", esp_err_to_name(ret));
+    }
+
+    return ESP_OK;
+}
 
 /* LVGL flush callback — sends buffer to MIPI-DSI DPI panel */
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)lv_display_get_user_data(disp);
-
-    /* For DPI panels with double buffering, draw_bitmap
-     * copies the dirty region into the next frame buffer */
     esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1,
                               area->x2 + 1, area->y2 + 1, px_map);
     lv_display_flush_ready(disp);
@@ -39,12 +110,41 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 /* Touch read callback for GT911 */
 static void lvgl_touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
-    /* TODO: Read GT911 touch data via I2C
-     * For now, report no touch — actual GT911 driver integration
-     * will read touch coordinates from the controller registers */
+    (void)indev;
     data->state = LV_INDEV_STATE_RELEASED;
     data->point.x = 0;
     data->point.y = 0;
+
+    if (!s_gt911_handle) return;
+
+    /* Read status register */
+    uint8_t status = 0;
+    if (gt911_read_reg(GT911_REG_STATUS, &status, 1) != ESP_OK) return;
+
+    /* Bit 7: buffer ready, bits 3:0: number of touch points */
+    if (!(status & 0x80)) return;
+
+    int touch_count = status & 0x0F;
+
+    if (touch_count > 0 && touch_count <= 5) {
+        /* Read first touch point (8 bytes: id, x_l, x_h, y_l, y_h, size_l, size_h, reserved) */
+        uint8_t point_data[7];
+        if (gt911_read_reg(GT911_REG_POINT1, point_data, 7) == ESP_OK) {
+            uint16_t x = (uint16_t)point_data[1] | ((uint16_t)point_data[2] << 8);
+            uint16_t y = (uint16_t)point_data[3] | ((uint16_t)point_data[4] << 8);
+
+            /* Clamp to display bounds */
+            if (x >= BSP_LCD_H_RES) x = BSP_LCD_H_RES - 1;
+            if (y >= BSP_LCD_V_RES) y = BSP_LCD_V_RES - 1;
+
+            data->state = LV_INDEV_STATE_PRESSED;
+            data->point.x = x;
+            data->point.y = y;
+        }
+    }
+
+    /* Clear status register — must write 0 to acknowledge */
+    gt911_write_reg(GT911_REG_STATUS, 0);
 }
 
 /* LVGL tick provider */
@@ -117,8 +217,7 @@ esp_err_t bsp_display_init(void)
         return ret;
     }
 
-    /* Step 4: Create the EK79007 panel with DPI video mode
-     * Timing values from Elecrow CrowPanel 7" ESP32-P4 reference code */
+    /* Step 4: Create the EK79007 panel with DPI video mode */
     esp_lcd_dpi_panel_config_t dpi_config = {
         .virtual_channel = 0,
         .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
@@ -138,10 +237,8 @@ esp_err_t bsp_display_init(void)
         .flags.use_dma2d = true,
     };
 
-    /* Use the EK79007 panel driver — sends vendor init commands via DBI
-     * then starts DPI video mode */
     ek79007_vendor_config_t vendor_config = {
-        .init_cmds = NULL,      /* Use built-in default init sequence */
+        .init_cmds = NULL,
         .init_cmds_size = 0,
         .mipi_config = {
             .dsi_bus = dsi_bus,
@@ -176,18 +273,21 @@ esp_err_t bsp_display_init(void)
     /* Step 5: Turn on backlight */
     bsp_extra_lcd_backlight_on();
 
-    /* Step 6: Initialize LVGL */
+    /* Step 6: Initialize GT911 touch controller */
+    ESP_LOGI(TAG, "Initializing GT911 touch...");
+    ret = gt911_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "GT911 init failed — touch disabled");
+    }
+
+    /* Step 7: Initialize LVGL */
     ESP_LOGI(TAG, "Initializing LVGL...");
     lv_init();
 
-    /* Create LVGL display */
     s_display = lv_display_create(BSP_LCD_H_RES, BSP_LCD_V_RES);
     lv_display_set_user_data(s_display, s_panel_handle);
     lv_display_set_flush_cb(s_display, lvgl_flush_cb);
 
-    /* Get the DPI panel's own frame buffers for direct-mode rendering.
-     * With num_fbs=2, the DPI panel owns two full frame buffers in PSRAM.
-     * LVGL draws directly into them, avoiding an extra copy step. */
     void *fb0 = NULL;
     void *fb1 = NULL;
     esp_lcd_dpi_panel_get_frame_buffer(s_panel_handle, 2, &fb0, &fb1);

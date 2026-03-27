@@ -225,7 +225,15 @@ static void face_scan_task(void *pvParam)
         img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888;
 
         /* Run face detection */
+        static int frame_count = 0;
+        frame_count++;
+        if (frame_count % 50 == 1) {
+            ESP_LOGI(TAG, "Scanning frame #%d (%dx%d)...", frame_count, img_width, img_height);
+        }
         auto &detections = s_detector->run(img);
+        if (frame_count % 50 == 1) {
+            ESP_LOGI(TAG, "Detection result: %d face(s)", (int)detections.size());
+        }
 
         if (!detections.empty()) {
             s_last_face_time = esp_timer_get_time();
