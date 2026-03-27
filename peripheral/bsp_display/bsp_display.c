@@ -124,6 +124,7 @@ esp_err_t bsp_display_init(void)
         .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = BSP_LCD_PIXEL_CLK_MHZ,
         .pixel_format = LCD_COLOR_PIXEL_FORMAT_RGB565,
+        .num_fbs = 2,
         .video_timing = {
             .h_size = BSP_LCD_H_RES,
             .v_size = BSP_LCD_V_RES,
@@ -134,6 +135,7 @@ esp_err_t bsp_display_init(void)
             .vsync_pulse_width = 4,
             .vsync_front_porch = 16,
         },
+        .flags.use_dma2d = true,
     };
 
     /* Create the DPI video mode panel */
