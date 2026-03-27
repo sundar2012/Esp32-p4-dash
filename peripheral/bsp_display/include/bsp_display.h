@@ -8,14 +8,18 @@
 extern "C" {
 #endif
 
-/* CrowPanel 7" display parameters */
+/* CrowPanel 7" display parameters (EK79007 panel) */
 #define BSP_LCD_H_RES           1024
 #define BSP_LCD_V_RES           600
-#define BSP_LCD_PIXEL_CLK_MHZ   40
+#define BSP_LCD_PIXEL_CLK_MHZ   51
 
-/* MIPI-DSI configuration for the CrowPanel's ILI9881C-based panel */
+/* MIPI-DSI configuration for the CrowPanel's EK79007-based panel */
 #define BSP_MIPI_DSI_LANE_NUM       2
-#define BSP_MIPI_DSI_LANE_BITRATE   (1000 * 1000 * 1000)  /* 1Gbps per lane */
+#define BSP_MIPI_DSI_LANE_BITRATE   (900 * 1000 * 1000)  /* 900Mbps per lane */
+
+/* Backlight GPIO (PWM) */
+#define BSP_LCD_GPIO_BLIGHT     31
+#define BSP_LCD_BLIGHT_PWM_HZ   30000
 
 /* Touch controller: Goodix GT911 on I2C */
 #define BSP_TOUCH_I2C_ADDR      0x5D

@@ -117,8 +117,8 @@ esp_err_t bsp_display_init(void)
         return ret;
     }
 
-    /* Step 4: Create the DPI panel (video mode) for the ILI9881C-based LCD
-     * Timing values are from the CrowPanel BSP datasheet */
+    /* Step 4: Create the DPI panel (video mode) for the EK79007-based LCD
+     * Timing values from Elecrow CrowPanel 7" ESP32-P4 reference code */
     esp_lcd_dpi_panel_config_t dpi_config = {
         .virtual_channel = 0,
         .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
@@ -128,12 +128,12 @@ esp_err_t bsp_display_init(void)
         .video_timing = {
             .h_size = BSP_LCD_H_RES,
             .v_size = BSP_LCD_V_RES,
-            .hsync_back_porch = 140,
-            .hsync_pulse_width = 40,
-            .hsync_front_porch = 40,
-            .vsync_back_porch = 16,
-            .vsync_pulse_width = 4,
-            .vsync_front_porch = 16,
+            .hsync_back_porch = 160,
+            .hsync_pulse_width = 70,
+            .hsync_front_porch = 160,
+            .vsync_back_porch = 23,
+            .vsync_pulse_width = 10,
+            .vsync_front_porch = 12,
         },
         .flags.use_dma2d = true,
     };
