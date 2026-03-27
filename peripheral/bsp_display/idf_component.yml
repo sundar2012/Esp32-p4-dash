@@ -3,5 +3,3 @@ dependencies:
     version: ">=5.4.0"
   lvgl/lvgl:
     version: "~9.2.0"
-  esp_lcd_mipi_dsi:
-    version: "*"
