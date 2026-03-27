@@ -127,6 +127,12 @@ static void passcode_reset(void)
     }
 }
 
+static void passcode_wrong_timer_cb(lv_timer_t *t)
+{
+    passcode_reset();
+    lv_timer_delete(t);
+}
+
 static void passcode_digit_cb(lv_event_t *e)
 {
     const char *digit_str = (const char *)lv_event_get_user_data(e);
@@ -153,10 +159,7 @@ static void passcode_digit_cb(lv_event_t *e)
                 lv_obj_set_style_text_color(s_passcode_status_label, lv_color_hex(0xff4040), 0);
             }
             /* Reset after a short visual delay via LVGL timer */
-            lv_timer_create([](lv_timer_t *t) {
-                passcode_reset();
-                lv_timer_delete(t);
-            }, 800, NULL);
+            lv_timer_create(passcode_wrong_timer_cb, 800, NULL);
         }
     }
 }
