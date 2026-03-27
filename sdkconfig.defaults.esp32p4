@@ -1,11 +1,2 @@
 # ESP32-P4 specific config
 CONFIG_IDF_TARGET="esp32p4"
-
-# MIPI-DSI Display
-CONFIG_MIPI_DSI_ENABLE=y
-
-# MIPI-CSI Camera
-CONFIG_MIPI_CSI_ENABLE=y
-
-# AI / Vector extensions
-CONFIG_ESP32P4_REV_MIN_0=y
