@@ -96,6 +96,25 @@ void app_face_set_callback(app_face_cb_t cb);
  */
 app_face_state_t app_face_get_state(void);
 
+/* Camera preview for enrollment UI */
+#define APP_FACE_PREVIEW_W  320
+#define APP_FACE_PREVIEW_H  188
+
+/**
+ * @brief Get a downscaled camera preview frame + last face bbox
+ *
+ * Copies the latest downscaled RGB565 preview into out_buf.
+ * Returns true if a face was detected in the last frame.
+ *
+ * @param out_buf     Destination buffer (must be at least PREVIEW_W * PREVIEW_H * 2 bytes)
+ * @param face_x      Output: face bbox X (in preview coords), or -1
+ * @param face_y      Output: face bbox Y (in preview coords), or -1
+ * @param face_w      Output: face bbox width, or 0
+ * @param face_h      Output: face bbox height, or 0
+ * @return true if preview data was available
+ */
+bool app_face_get_preview(uint16_t *out_buf, int *face_x, int *face_y, int *face_w, int *face_h);
+
 #ifdef __cplusplus
 }
 #endif

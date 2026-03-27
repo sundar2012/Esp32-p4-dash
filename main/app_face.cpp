@@ -58,6 +58,13 @@ static char s_enroll_name[APP_FACE_MAX_NAME_LEN];
 /* Timing */
 static int64_t s_last_face_time = 0;
 
+/* Camera preview (downscaled RGB565 for enrollment UI) */
+static uint16_t *s_preview_buf = nullptr;
+static SemaphoreHandle_t s_preview_mutex = nullptr;
+static bool s_preview_valid = false;
+static int s_preview_face_x = -1, s_preview_face_y = -1;
+static int s_preview_face_w = 0, s_preview_face_h = 0;
+
 #define FACE_SCAN_TASK_STACK    (32 * 1024)
 #define FACE_SCAN_TASK_PRIORITY 4
 
@@ -73,6 +80,52 @@ static void rgb565_to_rgb888(const uint8_t *src, uint8_t *dst, int width, int he
         dst[i * 3 + 1] = (pixel >> 3) & 0xFC;
         dst[i * 3 + 2] = (pixel << 3) & 0xF8;
     }
+}
+
+/* ──── Downscale RGB565 for preview ──── */
+
+static void rgb565_downscale(const uint16_t *src, int src_w, int src_h,
+                             uint16_t *dst, int dst_w, int dst_h)
+{
+    for (int oy = 0; oy < dst_h; oy++) {
+        int sy = oy * src_h / dst_h;
+        for (int ox = 0; ox < dst_w; ox++) {
+            int sx = ox * src_w / dst_w;
+            dst[oy * dst_w + ox] = src[sy * src_w + sx];
+        }
+    }
+}
+
+static void update_preview_frame(const uint8_t *frame_data, int frame_w, int frame_h)
+{
+    if (!s_preview_buf || !s_preview_mutex) return;
+    if (xSemaphoreTake(s_preview_mutex, pdMS_TO_TICKS(5)) != pdTRUE) return;
+
+    rgb565_downscale((const uint16_t *)frame_data, frame_w, frame_h,
+                     s_preview_buf, APP_FACE_PREVIEW_W, APP_FACE_PREVIEW_H);
+
+    /* Reset face bbox — will be updated separately if a face is found */
+    s_preview_face_x = -1;
+    s_preview_face_y = -1;
+    s_preview_face_w = 0;
+    s_preview_face_h = 0;
+    s_preview_valid = true;
+
+    xSemaphoreGive(s_preview_mutex);
+}
+
+static void update_preview_bbox(int frame_w, int frame_h,
+                                int fx, int fy, int fw, int fh)
+{
+    if (!s_preview_mutex) return;
+    if (xSemaphoreTake(s_preview_mutex, pdMS_TO_TICKS(5)) != pdTRUE) return;
+
+    s_preview_face_x = fx * APP_FACE_PREVIEW_W / frame_w;
+    s_preview_face_y = fy * APP_FACE_PREVIEW_H / frame_h;
+    s_preview_face_w = fw * APP_FACE_PREVIEW_W / frame_w;
+    s_preview_face_h = fh * APP_FACE_PREVIEW_H / frame_h;
+
+    xSemaphoreGive(s_preview_mutex);
 }
 
 /* ──── NVS: ID-to-name mapping persistence ──── */
@@ -215,6 +268,10 @@ static void face_scan_task(void *pvParam)
         rgb565_to_rgb888(fb->data, s_rgb888_buf, fb->width, fb->height);
         int img_width = fb->width;
         int img_height = fb->height;
+
+        /* Update preview buffer (before returning fb, since we need the raw RGB565) */
+        update_preview_frame(fb->data, img_width, img_height);
+
         bsp_camera_fb_return(fb);
 
         /* Create ESP-DL image descriptor */
@@ -241,6 +298,13 @@ static void face_scan_task(void *pvParam)
             auto &det = detections.front();
             ESP_LOGD(TAG, "Face at (%d,%d)-(%d,%d), score=%.2f",
                      (int)det.box[0], (int)det.box[1], (int)det.box[2], (int)det.box[3], (double)det.score);
+
+            /* Update preview with face bounding box */
+            int fx = (int)det.box[0];
+            int fy = (int)det.box[1];
+            int fw = (int)(det.box[2] - det.box[0]);
+            int fh = (int)(det.box[3] - det.box[1]);
+            update_preview_bbox(img_width, img_height, fx, fy, fw, fh);
 
             if (s_enrolling) {
                 /* Enroll the detected face into the recognizer's DB */
@@ -375,6 +439,14 @@ extern "C" esp_err_t app_face_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Allocate preview buffer and mutex for enrollment camera feed */
+    s_preview_buf = (uint16_t *)heap_caps_malloc(APP_FACE_PREVIEW_W * APP_FACE_PREVIEW_H * sizeof(uint16_t),
+                                                  MALLOC_CAP_SPIRAM);
+    if (!s_preview_buf) {
+        ESP_LOGW(TAG, "Failed to allocate preview buffer — enrollment preview disabled");
+    }
+    s_preview_mutex = xSemaphoreCreateMutex();
+
     ESP_LOGI(TAG, "Face recognition initialized (%d enrolled users, %d feats in DB)",
              s_user_count, s_recognizer->get_num_feats());
     ESP_LOGI(TAG, "Free PSRAM after model load: %lu bytes",
@@ -457,4 +529,19 @@ extern "C" void app_face_set_callback(app_face_cb_t cb)
 extern "C" app_face_state_t app_face_get_state(void)
 {
     return s_state;
+}
+
+extern "C" bool app_face_get_preview(uint16_t *out_buf, int *face_x, int *face_y, int *face_w, int *face_h)
+{
+    if (!s_preview_buf || !s_preview_mutex || !s_preview_valid) return false;
+    if (xSemaphoreTake(s_preview_mutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
+
+    memcpy(out_buf, s_preview_buf, APP_FACE_PREVIEW_W * APP_FACE_PREVIEW_H * sizeof(uint16_t));
+    *face_x = s_preview_face_x;
+    *face_y = s_preview_face_y;
+    *face_w = s_preview_face_w;
+    *face_h = s_preview_face_h;
+
+    xSemaphoreGive(s_preview_mutex);
+    return true;
 }

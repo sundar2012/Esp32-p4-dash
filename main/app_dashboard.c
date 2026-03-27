@@ -5,6 +5,7 @@
 #include "ui_guest.h"
 #include "ui_user2.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "lvgl.h"
 #include <string.h>
 
@@ -25,6 +26,12 @@ static lv_obj_t *s_passcode_status_label = NULL;
 
 /* Enrollment name selection */
 static char s_enroll_name[32] = {0};
+
+/* Enrollment camera preview */
+static lv_obj_t *s_enroll_canvas = NULL;
+static lv_timer_t *s_enroll_timer = NULL;
+static uint16_t *s_enroll_preview_buf = NULL;   /* LVGL canvas draw buffer */
+static uint16_t *s_enroll_cam_buf = NULL;       /* temp buffer for app_face_get_preview */
 
 /* ──── Splash screen ──── */
 
@@ -292,7 +299,7 @@ static lv_obj_t *create_passcode_screen(void)
     return scr;
 }
 
-/* ──── Enrollment screen ──── */
+/* ──── Enrollment screen with live camera preview ──── */
 
 static void enroll_name_cb(lv_event_t *e)
 {
@@ -302,14 +309,57 @@ static void enroll_name_cb(lv_event_t *e)
     app_face_enroll_start(s_enroll_name);
 
     /* Switch to the enrollment progress screen */
-    /* For now, show a simple status and go back to screensaver */
     app_dashboard_show(DASHBOARD_SCREENSAVER);
 }
 
 static void enroll_cancel_cb(lv_event_t *e)
 {
     (void)e;
+    /* Stop the preview timer */
+    if (s_enroll_timer) {
+        lv_timer_delete(s_enroll_timer);
+        s_enroll_timer = NULL;
+    }
     app_dashboard_show(DASHBOARD_SCREENSAVER);
+}
+
+static void enroll_preview_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_enroll_canvas || !s_enroll_cam_buf) return;
+
+    int face_x = -1, face_y = -1, face_w = 0, face_h = 0;
+    bool got = app_face_get_preview(s_enroll_cam_buf, &face_x, &face_y, &face_w, &face_h);
+    if (!got) return;
+
+    /* Copy camera frame into canvas buffer */
+    memcpy(s_enroll_preview_buf, s_enroll_cam_buf,
+           APP_FACE_PREVIEW_W * APP_FACE_PREVIEW_H * sizeof(uint16_t));
+
+    /* Draw green face rectangle if detected */
+    if (face_x >= 0 && face_w > 0 && face_h > 0) {
+        lv_layer_t layer;
+        lv_canvas_init_layer(s_enroll_canvas, &layer);
+
+        lv_draw_rect_dsc_t rect_dsc;
+        lv_draw_rect_dsc_init(&rect_dsc);
+        rect_dsc.bg_opa = LV_OPA_TRANSP;
+        rect_dsc.border_color = lv_color_hex(0x00ff00);
+        rect_dsc.border_width = 2;
+        rect_dsc.border_opa = LV_OPA_COVER;
+        rect_dsc.radius = 4;
+
+        lv_area_t area;
+        area.x1 = face_x;
+        area.y1 = face_y;
+        area.x2 = face_x + face_w;
+        area.y2 = face_y + face_h;
+        lv_draw_rect(&layer, &rect_dsc, &area);
+
+        lv_canvas_finish_layer(s_enroll_canvas, &layer);
+    }
+
+    lv_obj_invalidate(s_enroll_canvas);
 }
 
 static const char *enroll_names[] = {"sundar", "user2", "guest"};
@@ -324,31 +374,82 @@ static lv_obj_t *create_enrollment_screen(void)
     lv_label_set_text(title, LV_SYMBOL_EYE_OPEN "  Face Enrollment");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xe0e0ff), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+    /* ── Left side: camera preview canvas ── */
+
+    /* Allocate canvas draw buffer in PSRAM if not done yet */
+    if (!s_enroll_preview_buf) {
+        s_enroll_preview_buf = (uint16_t *)heap_caps_malloc(
+            APP_FACE_PREVIEW_W * APP_FACE_PREVIEW_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    }
+    if (!s_enroll_cam_buf) {
+        s_enroll_cam_buf = (uint16_t *)heap_caps_malloc(
+            APP_FACE_PREVIEW_W * APP_FACE_PREVIEW_H * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
+    }
+
+    if (s_enroll_preview_buf) {
+        memset(s_enroll_preview_buf, 0, APP_FACE_PREVIEW_W * APP_FACE_PREVIEW_H * sizeof(uint16_t));
+        s_enroll_canvas = lv_canvas_create(scr);
+        lv_canvas_set_buffer(s_enroll_canvas, s_enroll_preview_buf,
+                             APP_FACE_PREVIEW_W, APP_FACE_PREVIEW_H, LV_COLOR_FORMAT_RGB565);
+        lv_obj_align(s_enroll_canvas, LV_ALIGN_LEFT_MID, 30, 10);
+
+        /* Border around the preview */
+        lv_obj_set_style_border_color(s_enroll_canvas, lv_color_hex(0x404060), 0);
+        lv_obj_set_style_border_width(s_enroll_canvas, 2, 0);
+        lv_obj_set_style_radius(s_enroll_canvas, 8, 0);
+
+        /* Label under preview */
+        lv_obj_t *cam_label = lv_label_create(scr);
+        lv_label_set_text(cam_label, "Camera Preview");
+        lv_obj_set_style_text_font(cam_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(cam_label, lv_color_hex(0x606080), 0);
+        lv_obj_align_to(cam_label, s_enroll_canvas, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+
+        /* Start preview refresh timer (100ms = ~10 FPS) */
+        s_enroll_timer = lv_timer_create(enroll_preview_timer_cb, 100, NULL);
+    } else {
+        lv_obj_t *no_cam = lv_label_create(scr);
+        lv_label_set_text(no_cam, "Preview unavailable\n(no memory)");
+        lv_obj_set_style_text_font(no_cam, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(no_cam, lv_color_hex(0x808090), 0);
+        lv_obj_align(no_cam, LV_ALIGN_LEFT_MID, 50, 10);
+    }
+
+    /* ── Right side: enrollment controls ── */
+
+    /* Container for right panel */
+    lv_obj_t *right_panel = lv_obj_create(scr);
+    lv_obj_set_size(right_panel, 350, 480);
+    lv_obj_align(right_panel, LV_ALIGN_RIGHT_MID, -30, 10);
+    lv_obj_set_style_bg_opa(right_panel, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(right_panel, 0, 0);
+    lv_obj_set_style_pad_all(right_panel, 10, 0);
+    lv_obj_set_flex_flow(right_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(right_panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(right_panel, 12, 0);
 
     /* Instructions */
-    lv_obj_t *instr = lv_label_create(scr);
-    lv_label_set_text(instr, "Select a user to enroll, then face the camera.");
+    lv_obj_t *instr = lv_label_create(right_panel);
+    lv_label_set_text(instr, "Select user, face the camera.");
     lv_obj_set_style_text_font(instr, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(instr, lv_color_hex(0x808090), 0);
-    lv_obj_align(instr, LV_ALIGN_TOP_MID, 0, 75);
 
     /* Enrolled users count */
-    lv_obj_t *count_lbl = lv_label_create(scr);
+    lv_obj_t *count_lbl = lv_label_create(right_panel);
     char count_text[64];
-    snprintf(count_text, sizeof(count_text), "Enrolled users: %d / %d",
+    snprintf(count_text, sizeof(count_text), "Enrolled: %d / %d",
              app_face_get_user_count(), APP_FACE_MAX_USERS);
     lv_label_set_text(count_lbl, count_text);
     lv_obj_set_style_text_font(count_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(count_lbl, lv_color_hex(0x606080), 0);
-    lv_obj_align(count_lbl, LV_ALIGN_TOP_MID, 0, 110);
 
     /* Name buttons */
     int num_names = sizeof(enroll_names) / sizeof(enroll_names[0]);
     for (int i = 0; i < num_names; i++) {
-        lv_obj_t *btn = lv_btn_create(scr);
-        lv_obj_set_size(btn, 250, 60);
-        lv_obj_align(btn, LV_ALIGN_CENTER, 0, -60 + i * 80);
+        lv_obj_t *btn = lv_btn_create(right_panel);
+        lv_obj_set_size(btn, 280, 60);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0x1a2a4e), 0);
         lv_obj_set_style_radius(btn, 12, 0);
         lv_obj_add_event_cb(btn, enroll_name_cb, LV_EVENT_CLICKED, (void *)enroll_names[i]);
@@ -363,9 +464,8 @@ static lv_obj_t *create_enrollment_screen(void)
     }
 
     /* Cancel button */
-    lv_obj_t *cancel_btn = lv_btn_create(scr);
-    lv_obj_set_size(cancel_btn, 150, 50);
-    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_MID, 0, -30);
+    lv_obj_t *cancel_btn = lv_btn_create(right_panel);
+    lv_obj_set_size(cancel_btn, 200, 50);
     lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x3a2020), 0);
     lv_obj_set_style_radius(cancel_btn, 10, 0);
     lv_obj_add_event_cb(cancel_btn, enroll_cancel_cb, LV_EVENT_CLICKED, NULL);
@@ -386,6 +486,15 @@ void app_dashboard_show(dashboard_id_t id)
     if (id >= DASHBOARD_MAX) {
         ESP_LOGE(TAG, "Invalid dashboard ID: %d", id);
         return;
+    }
+
+    /* Stop enrollment preview timer when leaving enrollment screen */
+    if (s_current == DASHBOARD_ENROLLMENT && id != DASHBOARD_ENROLLMENT) {
+        if (s_enroll_timer) {
+            lv_timer_delete(s_enroll_timer);
+            s_enroll_timer = NULL;
+        }
+        s_enroll_canvas = NULL;
     }
 
     /* The settings screen is now the passcode entry gate */
