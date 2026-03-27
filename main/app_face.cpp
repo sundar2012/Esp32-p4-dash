@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_spiffs.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
@@ -14,27 +15,35 @@
 
 /* ESP-DL face detection and recognition headers */
 #include "human_face_detect.hpp"
-#include "human_face_feat.hpp"
+#include "human_face_recognition.hpp"
 
 static const char *TAG = "app_face";
 
 /* ESP-DL model instances */
 static HumanFaceDetect *s_detector = nullptr;
-static HumanFaceFeat *s_recognizer = nullptr;
+static HumanFaceRecognizer *s_recognizer = nullptr;
 
 /* RGB888 conversion buffer (allocated in PSRAM) */
 static uint8_t *s_rgb888_buf = nullptr;
 #define RGB888_BUF_SIZE (BSP_CAMERA_H_RES * BSP_CAMERA_V_RES * 3)
 
-/* Enrolled face database (in-memory, persisted to NVS) */
+/* SPIFFS mount point for face DB */
+#define FACE_DB_MOUNT_POINT "/spiffs"
+#define FACE_DB_PATH        "/spiffs/face.db"
+
+/*
+ * ID-to-name mapping stored in NVS.
+ * HumanFaceRecognizer assigns auto-incrementing uint16_t IDs.
+ * We map those IDs to user names in NVS.
+ */
 typedef struct {
     bool valid;
+    uint16_t face_id;
     char name[APP_FACE_MAX_NAME_LEN];
-    float embedding[APP_FACE_EMBEDDING_DIM];
-} face_entry_t;
+} face_name_entry_t;
 
-static face_entry_t s_face_db[APP_FACE_MAX_USERS];
-static int s_face_count = 0;
+static face_name_entry_t s_name_map[APP_FACE_MAX_USERS];
+static int s_user_count = 0;
 
 /* State */
 static app_face_state_t s_state = FACE_STATE_IDLE;
@@ -45,8 +54,6 @@ static bool s_scan_running = false;
 /* Enrollment state */
 static bool s_enrolling = false;
 static char s_enroll_name[APP_FACE_MAX_NAME_LEN];
-static int s_enroll_frame_count = 0;
-static float s_enroll_accum[APP_FACE_EMBEDDING_DIM];
 
 /* Timing */
 static int64_t s_last_face_time = 0;
@@ -62,16 +69,15 @@ static void rgb565_to_rgb888(const uint8_t *src, uint8_t *dst, int width, int he
     int total = width * height;
     for (int i = 0; i < total; i++) {
         uint16_t pixel = src16[i];
-        /* RGB565: RRRRRGGGGGGBBBBB (big-endian in memory from CSI) */
-        dst[i * 3 + 0] = (pixel >> 8) & 0xF8;         /* R: top 5 bits → 8 bits */
-        dst[i * 3 + 1] = (pixel >> 3) & 0xFC;          /* G: mid 6 bits → 8 bits */
-        dst[i * 3 + 2] = (pixel << 3) & 0xF8;          /* B: low 5 bits → 8 bits */
+        dst[i * 3 + 0] = (pixel >> 8) & 0xF8;
+        dst[i * 3 + 1] = (pixel >> 3) & 0xFC;
+        dst[i * 3 + 2] = (pixel << 3) & 0xF8;
     }
 }
 
-/* ──── NVS persistence ──── */
+/* ──── NVS: ID-to-name mapping persistence ──── */
 
-static esp_err_t face_db_save(void)
+static esp_err_t name_map_save(void)
 {
     nvs_handle_t nvs;
     esp_err_t ret = nvs_open_from_partition(APP_FACE_NVS_PARTITION, APP_FACE_NVS_NAMESPACE,
@@ -81,29 +87,27 @@ static esp_err_t face_db_save(void)
         if (ret != ESP_OK) return ret;
     }
 
-    nvs_set_i32(nvs, "count", s_face_count);
-
+    nvs_set_i32(nvs, "count", s_user_count);
     for (int i = 0; i < APP_FACE_MAX_USERS; i++) {
-        char key_valid[16], key_name[16], key_embed[16];
-        snprintf(key_valid, sizeof(key_valid), "v%d", i);
-        snprintf(key_name, sizeof(key_name), "n%d", i);
-        snprintf(key_embed, sizeof(key_embed), "e%d", i);
+        char kv[16], kn[16], ki[16];
+        snprintf(kv, sizeof(kv), "v%d", i);
+        snprintf(kn, sizeof(kn), "n%d", i);
+        snprintf(ki, sizeof(ki), "i%d", i);
 
-        nvs_set_u8(nvs, key_valid, s_face_db[i].valid ? 1 : 0);
-        if (s_face_db[i].valid) {
-            nvs_set_str(nvs, key_name, s_face_db[i].name);
-            nvs_set_blob(nvs, key_embed, s_face_db[i].embedding,
-                         sizeof(s_face_db[i].embedding));
+        nvs_set_u8(nvs, kv, s_name_map[i].valid ? 1 : 0);
+        if (s_name_map[i].valid) {
+            nvs_set_str(nvs, kn, s_name_map[i].name);
+            nvs_set_u16(nvs, ki, s_name_map[i].face_id);
         }
     }
 
     nvs_commit(nvs);
     nvs_close(nvs);
-    ESP_LOGI(TAG, "Face DB saved (%d users)", s_face_count);
+    ESP_LOGI(TAG, "Name map saved (%d users)", s_user_count);
     return ESP_OK;
 }
 
-static esp_err_t face_db_load(void)
+static esp_err_t name_map_load(void)
 {
     nvs_handle_t nvs;
     esp_err_t ret = nvs_open_from_partition(APP_FACE_NVS_PARTITION, APP_FACE_NVS_NAMESPACE,
@@ -111,133 +115,83 @@ static esp_err_t face_db_load(void)
     if (ret != ESP_OK) {
         ret = nvs_open(APP_FACE_NVS_NAMESPACE, NVS_READONLY, &nvs);
         if (ret != ESP_OK) {
-            ESP_LOGI(TAG, "No saved face DB found");
+            ESP_LOGI(TAG, "No saved name map found");
             return ESP_ERR_NOT_FOUND;
         }
     }
 
     int32_t count = 0;
     nvs_get_i32(nvs, "count", &count);
-    s_face_count = 0;
+    s_user_count = 0;
 
     for (int i = 0; i < APP_FACE_MAX_USERS; i++) {
-        char key_valid[16], key_name[16], key_embed[16];
-        snprintf(key_valid, sizeof(key_valid), "v%d", i);
-        snprintf(key_name, sizeof(key_name), "n%d", i);
-        snprintf(key_embed, sizeof(key_embed), "e%d", i);
+        char kv[16], kn[16], ki[16];
+        snprintf(kv, sizeof(kv), "v%d", i);
+        snprintf(kn, sizeof(kn), "n%d", i);
+        snprintf(ki, sizeof(ki), "i%d", i);
 
         uint8_t valid = 0;
-        nvs_get_u8(nvs, key_valid, &valid);
-        s_face_db[i].valid = (valid != 0);
+        nvs_get_u8(nvs, kv, &valid);
+        s_name_map[i].valid = (valid != 0);
 
-        if (s_face_db[i].valid) {
-            size_t name_len = sizeof(s_face_db[i].name);
-            nvs_get_str(nvs, key_name, s_face_db[i].name, &name_len);
-
-            size_t embed_len = sizeof(s_face_db[i].embedding);
-            nvs_get_blob(nvs, key_embed, s_face_db[i].embedding, &embed_len);
-            s_face_count++;
+        if (s_name_map[i].valid) {
+            size_t name_len = sizeof(s_name_map[i].name);
+            nvs_get_str(nvs, kn, s_name_map[i].name, &name_len);
+            nvs_get_u16(nvs, ki, &s_name_map[i].face_id);
+            s_user_count++;
         }
     }
 
     nvs_close(nvs);
-    ESP_LOGI(TAG, "Face DB loaded (%d users)", s_face_count);
+    ESP_LOGI(TAG, "Name map loaded (%d users)", s_user_count);
     return ESP_OK;
 }
 
-/* ──── Face matching (cosine similarity) ──── */
-
-static float cosine_similarity(const float *a, const float *b, int dim)
+static const char *name_for_id(uint16_t face_id)
 {
-    float dot = 0.0f, norm_a = 0.0f, norm_b = 0.0f;
-    for (int i = 0; i < dim; i++) {
-        dot += a[i] * b[i];
-        norm_a += a[i] * a[i];
-        norm_b += b[i] * b[i];
-    }
-    if (norm_a == 0.0f || norm_b == 0.0f) return 0.0f;
-    return dot / (sqrtf(norm_a) * sqrtf(norm_b));
-}
-
-static int face_match(const float *embedding, float *out_confidence)
-{
-    int best_idx = -1;
-    float best_score = APP_FACE_MATCH_THRESHOLD;
-
     for (int i = 0; i < APP_FACE_MAX_USERS; i++) {
-        if (!s_face_db[i].valid) continue;
-        float score = cosine_similarity(embedding, s_face_db[i].embedding, APP_FACE_EMBEDDING_DIM);
-        if (score > best_score) {
-            best_score = score;
-            best_idx = i;
+        if (s_name_map[i].valid && s_name_map[i].face_id == face_id) {
+            return s_name_map[i].name;
         }
     }
-
-    *out_confidence = best_score;
-    return best_idx;
+    return NULL;
 }
 
-/* ──── Face detection + recognition pipeline using ESP-DL ──── */
-
-typedef struct {
-    bool face_detected;
-    int x, y, w, h;
-    float embedding[APP_FACE_EMBEDDING_DIM];
-} face_detect_result_t;
-
-static esp_err_t face_detect_and_recognize(const bsp_camera_fb_t *fb, face_detect_result_t *result)
+static int name_map_add(uint16_t face_id, const char *name)
 {
-    result->face_detected = false;
-
-    if (!s_detector || !s_recognizer || !s_rgb888_buf) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    /* Convert camera RGB565 frame to RGB888 for ESP-DL models */
-    rgb565_to_rgb888(fb->data, s_rgb888_buf, fb->width, fb->height);
-
-    /* Create ESP-DL image tensor: HWC layout, RGB888 */
-    dl::image::img_t img;
-    img.data = s_rgb888_buf;
-    img.width = fb->width;
-    img.height = fb->height;
-    img.channel = 3;
-
-    /* Run face detection */
-    auto &detections = s_detector->run(img);
-
-    if (detections.empty()) {
-        return ESP_OK;
-    }
-
-    /* Use the first (highest-confidence) detected face */
-    auto &det = detections.front();
-    result->x = (int)det.box[0];
-    result->y = (int)det.box[1];
-    result->w = (int)(det.box[2] - det.box[0]);
-    result->h = (int)(det.box[3] - det.box[1]);
-
-    ESP_LOGD(TAG, "Face detected at (%d,%d) %dx%d, score=%.2f",
-             result->x, result->y, result->w, result->h, det.score);
-
-    /* Extract face feature embedding using the detected keypoints */
-    auto &feats = s_recognizer->run(img, detections);
-
-    if (!feats.empty()) {
-        result->face_detected = true;
-        /* Copy the embedding vector */
-        const auto &feat = feats.front();
-        int dim = feat.size();
-        if (dim > APP_FACE_EMBEDDING_DIM) dim = APP_FACE_EMBEDDING_DIM;
-        for (int i = 0; i < dim; i++) {
-            result->embedding[i] = feat[i];
-        }
-        /* Zero-pad if embedding is shorter than expected */
-        for (int i = dim; i < APP_FACE_EMBEDDING_DIM; i++) {
-            result->embedding[i] = 0.0f;
+    for (int i = 0; i < APP_FACE_MAX_USERS; i++) {
+        if (!s_name_map[i].valid) {
+            s_name_map[i].valid = true;
+            s_name_map[i].face_id = face_id;
+            strncpy(s_name_map[i].name, name, APP_FACE_MAX_NAME_LEN - 1);
+            s_name_map[i].name[APP_FACE_MAX_NAME_LEN - 1] = '\0';
+            s_user_count++;
+            name_map_save();
+            return i;
         }
     }
+    return -1;
+}
 
+/* ──── SPIFFS for face DB file ──── */
+
+static esp_err_t init_spiffs(void)
+{
+    esp_vfs_spiffs_conf_t conf = {};
+    conf.base_path = FACE_DB_MOUNT_POINT;
+    conf.partition_label = "storage";
+    conf.max_files = 5;
+    conf.format_if_mount_failed = true;
+
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount SPIFFS: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    size_t total = 0, used = 0;
+    esp_spiffs_info("storage", &total, &used);
+    ESP_LOGI(TAG, "SPIFFS mounted: %d/%d bytes used", (int)used, (int)total);
     return ESP_OK;
 }
 
@@ -257,55 +211,65 @@ static void face_scan_task(void *pvParam)
             continue;
         }
 
-        /* Run face detection + recognition */
-        face_detect_result_t det = {};
-        face_detect_and_recognize(fb, &det);
+        /* Convert camera RGB565 frame to RGB888 for ESP-DL models */
+        rgb565_to_rgb888(fb->data, s_rgb888_buf, fb->width, fb->height);
+        int img_width = fb->width;
+        int img_height = fb->height;
         bsp_camera_fb_return(fb);
 
-        if (det.face_detected) {
+        /* Create ESP-DL image descriptor */
+        dl::image::img_t img = {};
+        img.data = s_rgb888_buf;
+        img.width = img_width;
+        img.height = img_height;
+        img.pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888;
+
+        /* Run face detection */
+        auto &detections = s_detector->run(img);
+
+        if (!detections.empty()) {
             s_last_face_time = esp_timer_get_time();
 
+            auto &det = detections.front();
+            ESP_LOGD(TAG, "Face at (%.0f,%.0f)-(%.0f,%.0f), score=%.2f",
+                     det.box[0], det.box[1], det.box[2], det.box[3], det.score);
+
             if (s_enrolling) {
-                /* Accumulate embeddings for enrollment */
-                for (int i = 0; i < APP_FACE_EMBEDDING_DIM; i++) {
-                    s_enroll_accum[i] += det.embedding[i];
+                /* Enroll the detected face into the recognizer's DB */
+                esp_err_t err = s_recognizer->enroll(img, detections);
+                if (err == ESP_OK) {
+                    /* Get the ID that was just assigned (it's the latest entry) */
+                    int num_feats = s_recognizer->get_num_feats();
+                    /* The last enrolled ID = num_feats (1-based in ESP-DL DB) */
+                    uint16_t new_id = (uint16_t)(num_feats);
+                    int slot = name_map_add(new_id, s_enroll_name);
+                    ESP_LOGI(TAG, "Enrolled '%s' as face ID %d (slot %d)",
+                             s_enroll_name, new_id, slot);
+                } else {
+                    ESP_LOGW(TAG, "Enrollment failed: %s", esp_err_to_name(err));
                 }
-                s_enroll_frame_count++;
-                ESP_LOGI(TAG, "Enrollment frame %d/%d for '%s'",
-                         s_enroll_frame_count, APP_FACE_ENROLL_FRAMES, s_enroll_name);
-
-                if (s_enroll_frame_count >= APP_FACE_ENROLL_FRAMES) {
-                    /* Average the embeddings and store */
-                    int slot = -1;
-                    for (int i = 0; i < APP_FACE_MAX_USERS; i++) {
-                        if (!s_face_db[i].valid) { slot = i; break; }
-                    }
-                    if (slot >= 0) {
-                        for (int i = 0; i < APP_FACE_EMBEDDING_DIM; i++) {
-                            s_face_db[slot].embedding[i] = s_enroll_accum[i] / s_enroll_frame_count;
-                        }
-                        strncpy(s_face_db[slot].name, s_enroll_name, APP_FACE_MAX_NAME_LEN - 1);
-                        s_face_db[slot].valid = true;
-                        s_face_count++;
-                        face_db_save();
-                        ESP_LOGI(TAG, "Enrolled user '%s' in slot %d", s_enroll_name, slot);
-                    }
-                    s_enrolling = false;
-                    s_state = FACE_STATE_DETECTING;
-                }
+                s_enrolling = false;
+                s_state = FACE_STATE_DETECTING;
             } else {
-                /* Try to match against enrolled faces */
-                float confidence = 0.0f;
-                int match = face_match(det.embedding, &confidence);
+                /* Try to recognize the face */
+                auto results = s_recognizer->recognize(img, detections);
 
-                if (match >= 0) {
+                if (!results.empty() && results[0].similarity >= APP_FACE_MATCH_THRESHOLD) {
+                    auto &best = results[0];
+                    const char *name = name_for_id(best.id);
+
                     s_state = FACE_STATE_RECOGNIZED;
                     app_face_result_t result = {};
-                    result.user_id = match;
-                    result.confidence = confidence;
-                    strncpy(result.name, s_face_db[match].name, APP_FACE_MAX_NAME_LEN - 1);
+                    result.user_id = best.id;
+                    result.confidence = best.similarity;
+                    if (name) {
+                        strncpy(result.name, name, APP_FACE_MAX_NAME_LEN - 1);
+                    } else {
+                        snprintf(result.name, APP_FACE_MAX_NAME_LEN, "user_%d", best.id);
+                    }
 
-                    ESP_LOGI(TAG, "Recognized: %s (confidence: %.2f)", result.name, confidence);
+                    ESP_LOGI(TAG, "Recognized: %s (ID=%d, similarity=%.2f)",
+                             result.name, best.id, best.similarity);
 
                     if (s_callback) {
                         s_callback(FACE_STATE_RECOGNIZED, &result);
@@ -313,9 +277,9 @@ static void face_scan_task(void *pvParam)
 
                     /* Route to appropriate dashboard */
                     if (bsp_display_lock(100)) {
-                        if (strcmp(result.name, "sundar") == 0) {
+                        if (name && strcmp(name, "sundar") == 0) {
                             app_dashboard_show(DASHBOARD_SUNDAR);
-                        } else if (strcmp(result.name, "user2") == 0) {
+                        } else if (name && strcmp(name, "user2") == 0) {
                             app_dashboard_show(DASHBOARD_USER2);
                         } else {
                             app_dashboard_show(DASHBOARD_GUEST);
@@ -361,11 +325,18 @@ extern "C" esp_err_t app_face_init(void)
 {
     ESP_LOGI(TAG, "Initializing face recognition system...");
 
-    memset(s_face_db, 0, sizeof(s_face_db));
-    s_face_count = 0;
+    memset(s_name_map, 0, sizeof(s_name_map));
+    s_user_count = 0;
 
-    /* Load enrolled faces from NVS */
-    face_db_load();
+    /* Mount SPIFFS for face DB file */
+    esp_err_t ret = init_spiffs();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPIFFS init failed — face recognition disabled");
+        return ret;
+    }
+
+    /* Load ID-to-name mapping from NVS */
+    name_map_load();
 
     /* Allocate RGB888 conversion buffer in PSRAM */
     s_rgb888_buf = (uint8_t *)heap_caps_malloc(RGB888_BUF_SIZE, MALLOC_CAP_SPIRAM);
@@ -374,7 +345,7 @@ extern "C" esp_err_t app_face_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* Initialize face detection model (two-stage, optimized for ESP32-P4) */
+    /* Initialize face detection model */
     ESP_LOGI(TAG, "Loading face detection model...");
     s_detector = new (std::nothrow) HumanFaceDetect();
     if (!s_detector) {
@@ -384,9 +355,9 @@ extern "C" esp_err_t app_face_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    /* Initialize face recognition / feature extraction model */
+    /* Initialize face recognizer (detection + feature extraction + DB) */
     ESP_LOGI(TAG, "Loading face recognition model...");
-    s_recognizer = new (std::nothrow) HumanFaceFeat();
+    s_recognizer = new (std::nothrow) HumanFaceRecognizer(FACE_DB_PATH);
     if (!s_recognizer) {
         ESP_LOGE(TAG, "Failed to create face recognizer");
         delete s_detector;
@@ -396,7 +367,8 @@ extern "C" esp_err_t app_face_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Face recognition initialized (%d enrolled users)", s_face_count);
+    ESP_LOGI(TAG, "Face recognition initialized (%d enrolled users, %d feats in DB)",
+             s_user_count, s_recognizer->get_num_feats());
     ESP_LOGI(TAG, "Free PSRAM after model load: %lu bytes",
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return ESP_OK;
@@ -425,19 +397,17 @@ extern "C" void app_face_stop(void)
 extern "C" esp_err_t app_face_enroll_start(const char *name)
 {
     if (!name || strlen(name) == 0) return ESP_ERR_INVALID_ARG;
-    if (s_face_count >= APP_FACE_MAX_USERS) {
+    if (s_user_count >= APP_FACE_MAX_USERS) {
         ESP_LOGE(TAG, "Face DB full (%d users)", APP_FACE_MAX_USERS);
         return ESP_ERR_NO_MEM;
     }
 
     strncpy(s_enroll_name, name, APP_FACE_MAX_NAME_LEN - 1);
     s_enroll_name[APP_FACE_MAX_NAME_LEN - 1] = '\0';
-    memset(s_enroll_accum, 0, sizeof(s_enroll_accum));
-    s_enroll_frame_count = 0;
     s_enrolling = true;
     s_state = FACE_STATE_ENROLLING;
 
-    ESP_LOGI(TAG, "Enrollment started for '%s' — capture %d frames", name, APP_FACE_ENROLL_FRAMES);
+    ESP_LOGI(TAG, "Enrollment started for '%s'", name);
     return ESP_OK;
 }
 
@@ -451,12 +421,14 @@ extern "C" void app_face_enroll_cancel(void)
 extern "C" esp_err_t app_face_delete_user(const char *name)
 {
     for (int i = 0; i < APP_FACE_MAX_USERS; i++) {
-        if (s_face_db[i].valid && strcmp(s_face_db[i].name, name) == 0) {
-            s_face_db[i].valid = false;
-            memset(s_face_db[i].name, 0, sizeof(s_face_db[i].name));
-            memset(s_face_db[i].embedding, 0, sizeof(s_face_db[i].embedding));
-            s_face_count--;
-            face_db_save();
+        if (s_name_map[i].valid && strcmp(s_name_map[i].name, name) == 0) {
+            if (s_recognizer) {
+                s_recognizer->delete_feat(s_name_map[i].face_id);
+            }
+            s_name_map[i].valid = false;
+            memset(s_name_map[i].name, 0, sizeof(s_name_map[i].name));
+            s_user_count--;
+            name_map_save();
             ESP_LOGI(TAG, "Deleted user '%s'", name);
             return ESP_OK;
         }
@@ -466,7 +438,7 @@ extern "C" esp_err_t app_face_delete_user(const char *name)
 
 extern "C" int app_face_get_user_count(void)
 {
-    return s_face_count;
+    return s_user_count;
 }
 
 extern "C" void app_face_set_callback(app_face_cb_t cb)
