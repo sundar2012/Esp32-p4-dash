@@ -231,8 +231,8 @@ static void face_scan_task(void *pvParam)
             s_last_face_time = esp_timer_get_time();
 
             auto &det = detections.front();
-            ESP_LOGD(TAG, "Face at (%.0f,%.0f)-(%.0f,%.0f), score=%.2f",
-                     det.box[0], det.box[1], det.box[2], det.box[3], det.score);
+            ESP_LOGD(TAG, "Face at (%d,%d)-(%d,%d), score=%.2f",
+                     (int)det.box[0], (int)det.box[1], (int)det.box[2], (int)det.box[3], (double)det.score);
 
             if (s_enrolling) {
                 /* Enroll the detected face into the recognizer's DB */
