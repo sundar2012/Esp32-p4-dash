@@ -96,7 +96,7 @@ void app_main(void)
     /* Show the guest dashboard after splash */
     vTaskDelay(pdMS_TO_TICKS(1500));  /* Show splash for 1.5s */
     if (bsp_display_lock(-1)) {
-        app_dashboard_show(DASHBOARD_GUEST);
+        app_dashboard_show(DASHBOARD_SUNDAR);
         bsp_display_unlock();
     }
 
