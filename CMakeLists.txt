@@ -13,3 +13,8 @@ set(EXTRA_COMPONENT_DIRS
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(crowpanel-face-dashboard)
+
+# Workaround: GCC 14.2 false positive -Wstringop-overflow in ESP-DL's dl_tensor_base.cpp
+# This is a known issue with esp-dl v3.3.0 + GCC 14.x inlining heuristics
+idf_component_get_property(espdl espressif__esp-dl COMPONENT_LIB)
+target_compile_options(${espdl} PRIVATE -Wno-stringop-overflow)
