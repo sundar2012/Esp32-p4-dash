@@ -11,7 +11,7 @@ extern "C" {
 /* CrowPanel 7" display parameters */
 #define BSP_LCD_H_RES           1024
 #define BSP_LCD_V_RES           600
-#define BSP_LCD_PIXEL_CLK_MHZ   40
+#define BSP_LCD_PIXEL_CLK_MHZ   25
 
 /* MIPI-DSI configuration for the CrowPanel's ILI9881C-based panel */
 #define BSP_MIPI_DSI_LANE_NUM       2
