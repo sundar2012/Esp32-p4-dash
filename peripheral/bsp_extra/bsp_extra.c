@@ -10,8 +10,8 @@ static bool s_backlight_initialized = false;
 
 #define BSP_BACKLIGHT_LEDC_TIMER    LEDC_TIMER_0
 #define BSP_BACKLIGHT_LEDC_CHANNEL  LEDC_CHANNEL_0
-#define BSP_BACKLIGHT_LEDC_FREQ_HZ  5000
-#define BSP_BACKLIGHT_LEDC_DUTY_RES LEDC_TIMER_10_BIT
+#define BSP_BACKLIGHT_LEDC_FREQ_HZ  30000
+#define BSP_BACKLIGHT_LEDC_DUTY_RES LEDC_TIMER_11_BIT
 
 esp_err_t bsp_extra_power_init(void)
 {

@@ -14,7 +14,7 @@ extern "C" {
 #define BSP_LDO_VOLTAGE_PERIPH_MV   3300
 #define BSP_LDO_CHANNEL_MIPI        3
 #define BSP_LDO_VOLTAGE_MIPI_MV     2500
-#define BSP_LCD_BACKLIGHT_PIN       26
+#define BSP_LCD_BACKLIGHT_PIN       31
 #define BSP_LCD_BACKLIGHT_ON_LEVEL  1
 
 /**

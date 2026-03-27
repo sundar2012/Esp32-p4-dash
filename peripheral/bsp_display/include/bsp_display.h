@@ -23,8 +23,8 @@ extern "C" {
 
 /* Touch controller: Goodix GT911 on I2C */
 #define BSP_TOUCH_I2C_ADDR      0x5D
-#define BSP_TOUCH_RST_PIN       6
-#define BSP_TOUCH_INT_PIN       5
+#define BSP_TOUCH_RST_PIN       40
+#define BSP_TOUCH_INT_PIN       42
 
 /**
  * @brief Initialize the MIPI-DSI display and touch controller

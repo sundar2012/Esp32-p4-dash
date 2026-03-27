@@ -11,8 +11,8 @@ extern "C" {
  * I2C0: Touch controller (GT911) + other peripherals
  * GPIO pins per CrowPanel schematic */
 #define BSP_I2C_NUM         I2C_NUM_0
-#define BSP_I2C_SCL_PIN     8
-#define BSP_I2C_SDA_PIN     7
+#define BSP_I2C_SCL_PIN     46
+#define BSP_I2C_SDA_PIN     45
 #define BSP_I2C_FREQ_HZ     400000
 
 /**
