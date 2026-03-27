@@ -4,6 +4,7 @@
 #include "app_face.h"
 #include "bsp_display.h"
 #include "esp_log.h"
+#include <string.h>
 
 static const char *TAG = "ui_sundar";
 
