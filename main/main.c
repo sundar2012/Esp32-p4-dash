@@ -83,21 +83,31 @@ void app_main(void)
 
     /* Step 8: Initialize face recognition */
     ESP_LOGI(TAG, "Starting face recognition...");
+    bool face_available = false;
     ret = app_face_init();
     if (ret == ESP_OK) {
-        /* Only start face scanning if camera is available */
-        /* For now, go straight to guest dashboard since face detection
-         * is not yet integrated with ESP-WHO models */
-        ESP_LOGI(TAG, "Face scanning deferred — showing guest dashboard");
+        face_available = true;
+        ESP_LOGI(TAG, "Face recognition models loaded successfully");
     } else {
-        ESP_LOGW(TAG, "Face recognition unavailable");
+        ESP_LOGW(TAG, "Face recognition unavailable: %s", esp_err_to_name(ret));
     }
 
-    /* Show the guest dashboard after splash */
+    /* Show the screensaver after splash, then start face scanning */
     vTaskDelay(pdMS_TO_TICKS(1500));  /* Show splash for 1.5s */
     if (bsp_display_lock(-1)) {
-        app_dashboard_show(DASHBOARD_SUNDAR);
+        if (face_available) {
+            app_dashboard_show(DASHBOARD_SCREENSAVER);
+        } else {
+            /* No face recognition — go straight to Sundar's dashboard */
+            app_dashboard_show(DASHBOARD_SUNDAR);
+        }
         bsp_display_unlock();
+    }
+
+    /* Start face scanning in background */
+    if (face_available) {
+        app_face_start();
+        ESP_LOGI(TAG, "Face scanning active — waiting for faces...");
     }
 
     ESP_LOGI(TAG, "System initialization complete");

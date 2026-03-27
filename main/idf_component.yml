@@ -3,3 +3,5 @@ dependencies:
     version: ">=5.4.0"
   lvgl/lvgl:
     version: "~9.2.0"
+  espressif/human_face_recognition:
+    version: "~0.3.1"

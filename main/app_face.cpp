@@ -4,6 +4,7 @@
 #include "bsp_display.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "freertos/FreeRTOS.h"
@@ -11,7 +12,19 @@
 #include <string.h>
 #include <math.h>
 
+/* ESP-DL face detection and recognition headers */
+#include "human_face_detect.hpp"
+#include "human_face_feat.hpp"
+
 static const char *TAG = "app_face";
+
+/* ESP-DL model instances */
+static HumanFaceDetect *s_detector = nullptr;
+static HumanFaceFeat *s_recognizer = nullptr;
+
+/* RGB888 conversion buffer (allocated in PSRAM) */
+static uint8_t *s_rgb888_buf = nullptr;
+#define RGB888_BUF_SIZE (BSP_CAMERA_H_RES * BSP_CAMERA_V_RES * 3)
 
 /* Enrolled face database (in-memory, persisted to NVS) */
 typedef struct {
@@ -38,8 +51,23 @@ static float s_enroll_accum[APP_FACE_EMBEDDING_DIM];
 /* Timing */
 static int64_t s_last_face_time = 0;
 
-#define FACE_SCAN_TASK_STACK    (16 * 1024)
+#define FACE_SCAN_TASK_STACK    (32 * 1024)
 #define FACE_SCAN_TASK_PRIORITY 4
+
+/* ──── RGB565 → RGB888 conversion ──── */
+
+static void rgb565_to_rgb888(const uint8_t *src, uint8_t *dst, int width, int height)
+{
+    const uint16_t *src16 = (const uint16_t *)src;
+    int total = width * height;
+    for (int i = 0; i < total; i++) {
+        uint16_t pixel = src16[i];
+        /* RGB565: RRRRRGGGGGGBBBBB (big-endian in memory from CSI) */
+        dst[i * 3 + 0] = (pixel >> 8) & 0xF8;         /* R: top 5 bits → 8 bits */
+        dst[i * 3 + 1] = (pixel >> 3) & 0xFC;          /* G: mid 6 bits → 8 bits */
+        dst[i * 3 + 2] = (pixel << 3) & 0xF8;          /* B: low 5 bits → 8 bits */
+    }
+}
 
 /* ──── NVS persistence ──── */
 
@@ -49,15 +77,12 @@ static esp_err_t face_db_save(void)
     esp_err_t ret = nvs_open_from_partition(APP_FACE_NVS_PARTITION, APP_FACE_NVS_NAMESPACE,
                                              NVS_READWRITE, &nvs);
     if (ret != ESP_OK) {
-        /* Fall back to default NVS partition */
         ret = nvs_open(APP_FACE_NVS_NAMESPACE, NVS_READWRITE, &nvs);
         if (ret != ESP_OK) return ret;
     }
 
-    /* Store face count */
     nvs_set_i32(nvs, "count", s_face_count);
 
-    /* Store each face entry */
     for (int i = 0; i < APP_FACE_MAX_USERS; i++) {
         char key_valid[16], key_name[16], key_embed[16];
         snprintf(key_valid, sizeof(key_valid), "v%d", i);
@@ -152,49 +177,67 @@ static int face_match(const float *embedding, float *out_confidence)
     return best_idx;
 }
 
-/* ──── Face detection / recognition pipeline ──── */
-
-/*
- * ESP-WHO integration point:
- * In production, this function would use ESP-WHO's face detection model
- * (e.g., MTMN or blazeface) to locate faces in the camera frame, then
- * the face recognition model to generate a 512-dim embedding.
- *
- * The ESP-WHO pipeline runs as:
- *   1. Camera frame → Face detection → Bounding boxes
- *   2. Crop + align face region
- *   3. Face recognition model → 512-dim embedding
- *   4. Compare embedding against enrolled faces
- *
- * For the scaffold, we define the interface that the ESP-WHO models
- * will plug into.
- */
+/* ──── Face detection + recognition pipeline using ESP-DL ──── */
 
 typedef struct {
     bool face_detected;
-    int x, y, w, h;                         /* Bounding box */
-    float embedding[APP_FACE_EMBEDDING_DIM]; /* Recognition embedding */
+    int x, y, w, h;
+    float embedding[APP_FACE_EMBEDDING_DIM];
 } face_detect_result_t;
 
 static esp_err_t face_detect_and_recognize(const bsp_camera_fb_t *fb, face_detect_result_t *result)
 {
-    /* TODO: Integrate ESP-WHO face detection + recognition models here.
-     *
-     * Expected flow:
-     *   dl_matrix3du_t *image = dl_matrix3du_alloc(1, fb->width, fb->height, 3);
-     *   // Convert RGB565 → RGB888 into image
-     *   box_array_t *boxes = face_detect(image, &mtmn_config);
-     *   if (boxes && boxes->len > 0) {
-     *       // Crop and align face
-     *       // Run recognition model to get embedding
-     *       face_id_t *id = face_recognition(aligned_face);
-     *       memcpy(result->embedding, id->embedding, sizeof(result->embedding));
-     *       result->face_detected = true;
-     *   }
-     *
-     * For now, signal no face detected until ESP-WHO is integrated. */
-    (void)fb;
     result->face_detected = false;
+
+    if (!s_detector || !s_recognizer || !s_rgb888_buf) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Convert camera RGB565 frame to RGB888 for ESP-DL models */
+    rgb565_to_rgb888(fb->data, s_rgb888_buf, fb->width, fb->height);
+
+    /* Create ESP-DL image tensor: HWC layout, RGB888 */
+    dl::image::img_t img;
+    img.data = s_rgb888_buf;
+    img.width = fb->width;
+    img.height = fb->height;
+    img.channel = 3;
+
+    /* Run face detection */
+    auto &detections = s_detector->run(img);
+
+    if (detections.empty()) {
+        return ESP_OK;
+    }
+
+    /* Use the first (highest-confidence) detected face */
+    auto &det = detections.front();
+    result->x = (int)det.box[0];
+    result->y = (int)det.box[1];
+    result->w = (int)(det.box[2] - det.box[0]);
+    result->h = (int)(det.box[3] - det.box[1]);
+
+    ESP_LOGD(TAG, "Face detected at (%d,%d) %dx%d, score=%.2f",
+             result->x, result->y, result->w, result->h, det.score);
+
+    /* Extract face feature embedding using the detected keypoints */
+    auto &feats = s_recognizer->run(img, detections);
+
+    if (!feats.empty()) {
+        result->face_detected = true;
+        /* Copy the embedding vector */
+        const auto &feat = feats.front();
+        int dim = feat.size();
+        if (dim > APP_FACE_EMBEDDING_DIM) dim = APP_FACE_EMBEDDING_DIM;
+        for (int i = 0; i < dim; i++) {
+            result->embedding[i] = feat[i];
+        }
+        /* Zero-pad if embedding is shorter than expected */
+        for (int i = dim; i < APP_FACE_EMBEDDING_DIM; i++) {
+            result->embedding[i] = 0.0f;
+        }
+    }
+
     return ESP_OK;
 }
 
@@ -215,7 +258,7 @@ static void face_scan_task(void *pvParam)
         }
 
         /* Run face detection + recognition */
-        face_detect_result_t det = {0};
+        face_detect_result_t det = {};
         face_detect_and_recognize(fb, &det);
         bsp_camera_fb_return(fb);
 
@@ -257,10 +300,9 @@ static void face_scan_task(void *pvParam)
 
                 if (match >= 0) {
                     s_state = FACE_STATE_RECOGNIZED;
-                    app_face_result_t result = {
-                        .user_id = match,
-                        .confidence = confidence,
-                    };
+                    app_face_result_t result = {};
+                    result.user_id = match;
+                    result.confidence = confidence;
                     strncpy(result.name, s_face_db[match].name, APP_FACE_MAX_NAME_LEN - 1);
 
                     ESP_LOGI(TAG, "Recognized: %s (confidence: %.2f)", result.name, confidence);
@@ -305,8 +347,8 @@ static void face_scan_task(void *pvParam)
             }
         }
 
-        /* ~10 FPS scan rate */
-        vTaskDelay(pdMS_TO_TICKS(100));
+        /* ~5 FPS scan rate (face detection + recognition takes ~110ms on P4) */
+        vTaskDelay(pdMS_TO_TICKS(80));
     }
 
     ESP_LOGI(TAG, "Face scan task stopped");
@@ -315,7 +357,7 @@ static void face_scan_task(void *pvParam)
 
 /* ──── Public API ──── */
 
-esp_err_t app_face_init(void)
+extern "C" esp_err_t app_face_init(void)
 {
     ESP_LOGI(TAG, "Initializing face recognition system...");
 
@@ -325,17 +367,48 @@ esp_err_t app_face_init(void)
     /* Load enrolled faces from NVS */
     face_db_load();
 
-    /* TODO: Load ESP-WHO face detection + recognition models into memory.
-     * Models are stored in the app partition and loaded at init time.
-     * Typical memory usage: ~2-4MB for both models combined. */
+    /* Allocate RGB888 conversion buffer in PSRAM */
+    s_rgb888_buf = (uint8_t *)heap_caps_malloc(RGB888_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    if (!s_rgb888_buf) {
+        ESP_LOGE(TAG, "Failed to allocate RGB888 buffer (%d bytes)", RGB888_BUF_SIZE);
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Initialize face detection model (two-stage, optimized for ESP32-P4) */
+    ESP_LOGI(TAG, "Loading face detection model...");
+    s_detector = new (std::nothrow) HumanFaceDetect();
+    if (!s_detector) {
+        ESP_LOGE(TAG, "Failed to create face detector");
+        heap_caps_free(s_rgb888_buf);
+        s_rgb888_buf = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Initialize face recognition / feature extraction model */
+    ESP_LOGI(TAG, "Loading face recognition model...");
+    s_recognizer = new (std::nothrow) HumanFaceFeat();
+    if (!s_recognizer) {
+        ESP_LOGE(TAG, "Failed to create face recognizer");
+        delete s_detector;
+        s_detector = nullptr;
+        heap_caps_free(s_rgb888_buf);
+        s_rgb888_buf = nullptr;
+        return ESP_ERR_NO_MEM;
+    }
 
     ESP_LOGI(TAG, "Face recognition initialized (%d enrolled users)", s_face_count);
+    ESP_LOGI(TAG, "Free PSRAM after model load: %lu bytes",
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return ESP_OK;
 }
 
-void app_face_start(void)
+extern "C" void app_face_start(void)
 {
     if (s_scan_running) return;
+    if (!s_detector || !s_recognizer) {
+        ESP_LOGE(TAG, "Cannot start scan — models not loaded");
+        return;
+    }
 
     s_scan_running = true;
     s_state = FACE_STATE_DETECTING;
@@ -343,14 +416,13 @@ void app_face_start(void)
                             NULL, FACE_SCAN_TASK_PRIORITY, &s_scan_task, 1);
 }
 
-void app_face_stop(void)
+extern "C" void app_face_stop(void)
 {
     s_scan_running = false;
     s_state = FACE_STATE_IDLE;
-    /* Task will self-delete when it exits the loop */
 }
 
-esp_err_t app_face_enroll_start(const char *name)
+extern "C" esp_err_t app_face_enroll_start(const char *name)
 {
     if (!name || strlen(name) == 0) return ESP_ERR_INVALID_ARG;
     if (s_face_count >= APP_FACE_MAX_USERS) {
@@ -369,14 +441,14 @@ esp_err_t app_face_enroll_start(const char *name)
     return ESP_OK;
 }
 
-void app_face_enroll_cancel(void)
+extern "C" void app_face_enroll_cancel(void)
 {
     s_enrolling = false;
     s_state = FACE_STATE_DETECTING;
     ESP_LOGI(TAG, "Enrollment cancelled");
 }
 
-esp_err_t app_face_delete_user(const char *name)
+extern "C" esp_err_t app_face_delete_user(const char *name)
 {
     for (int i = 0; i < APP_FACE_MAX_USERS; i++) {
         if (s_face_db[i].valid && strcmp(s_face_db[i].name, name) == 0) {
@@ -392,17 +464,17 @@ esp_err_t app_face_delete_user(const char *name)
     return ESP_ERR_NOT_FOUND;
 }
 
-int app_face_get_user_count(void)
+extern "C" int app_face_get_user_count(void)
 {
     return s_face_count;
 }
 
-void app_face_set_callback(app_face_cb_t cb)
+extern "C" void app_face_set_callback(app_face_cb_t cb)
 {
     s_callback = cb;
 }
 
-app_face_state_t app_face_get_state(void)
+extern "C" app_face_state_t app_face_get_state(void)
 {
     return s_state;
 }

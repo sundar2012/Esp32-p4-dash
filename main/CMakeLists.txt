@@ -2,7 +2,7 @@ idf_component_register(
     SRCS
         "main.c"
         "app_wifi.c"
-        "app_face.c"
+        "app_face.cpp"
         "app_dashboard.c"
         "ui_sundar.c"
         "ui_guest.c"
@@ -21,4 +21,5 @@ idf_component_register(
         esp_http_client
         esp_timer
         esp_wifi
+        human_face_recognition
 )
