@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_mipi_dsi.h"
+#include "esp_lcd_ek79007.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -117,7 +118,7 @@ esp_err_t bsp_display_init(void)
         return ret;
     }
 
-    /* Step 4: Create the DPI panel (video mode) for the EK79007-based LCD
+    /* Step 4: Create the EK79007 panel with DPI video mode
      * Timing values from Elecrow CrowPanel 7" ESP32-P4 reference code */
     esp_lcd_dpi_panel_config_t dpi_config = {
         .virtual_channel = 0,
@@ -138,10 +139,32 @@ esp_err_t bsp_display_init(void)
         .flags.use_dma2d = true,
     };
 
-    /* Create the DPI video mode panel */
-    ret = esp_lcd_new_panel_dpi(dsi_bus, &dpi_config, &s_panel_handle);
+    /* Use the EK79007 panel driver — sends vendor init commands via DBI
+     * then starts DPI video mode */
+    ek79007_vendor_config_t vendor_config = {
+        .init_cmds = NULL,      /* Use built-in default init sequence */
+        .init_cmds_size = 0,
+        .mipi_config = {
+            .dsi_bus = dsi_bus,
+            .dpi_config = &dpi_config,
+            .lane_num = BSP_MIPI_DSI_LANE_NUM,
+        },
+    };
+    esp_lcd_panel_dev_config_t panel_config = {
+        .reset_gpio_num = -1,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+        .vendor_config = &vendor_config,
+    };
+    ret = esp_lcd_new_panel_ek79007(io_handle, &panel_config, &s_panel_handle);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to create DPI panel: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to create EK79007 panel: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = esp_lcd_panel_reset(s_panel_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Panel reset failed: %s", esp_err_to_name(ret));
         return ret;
     }
 
@@ -204,7 +227,7 @@ esp_err_t bsp_display_init(void)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "Display initialized: %dx%d, MIPI-DSI %d lanes",
+    ESP_LOGI(TAG, "Display initialized: %dx%d, MIPI-DSI %d lanes (EK79007)",
              BSP_LCD_H_RES, BSP_LCD_V_RES, BSP_MIPI_DSI_LANE_NUM);
     return ESP_OK;
 }
